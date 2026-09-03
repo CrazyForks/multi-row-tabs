@@ -10,6 +10,10 @@
   let launcher = null;
   let enabled = false;
   let lastSig = "";
+  let renderSeq = 0; // 渲染序号：并发 render 时仅应用最新一次的快照，丢弃过期响应
+  const pendingClose = new Map(); // 已请求关闭、尚未被后台快照确认的标签：tabId -> 请求时间
+  let sortMenuOpen = false; // 排序下拉展开状态：render 重建后恢复，避免重绘期间菜单意外收起
+  let sortCloseHandler = null; // 排序下拉的 document 级点击外部关闭处理器（render 重建时需清理旧引用）
   let floatOpen = false;
   let hotkey = "Alt+Z"; // 用户自定义快捷键，默认 Alt+Z
   let sortMode = "default"; // 排序方式：default 与浏览器一致 / title 按名称 / host 按域名
@@ -229,7 +233,16 @@
     return tabs; // default：保持浏览器标签原始顺序
   }
 
+  // 关闭请求已发出：本地立即移除并同步计数，等 background 广播刷新后完全重绘
+  function removeTabLocally(item, tabId) {
+    pendingClose.set(tabId, Date.now());
+    if (item) item.remove();
+    const c = bar && bar.querySelector(".mrt-count");
+    if (c) c.textContent = String(Math.max(0, (parseInt(c.textContent, 10) || 0) - 1));
+  }
+
   async function render() {
+    const seq = ++renderSeq;
     if (!enabled) {
       if (bar) {
         bar.remove();
@@ -251,7 +264,15 @@
       return;
     }
     if (!resp || !resp.tabs) return;
-    const tabs = sortTabs(resp.tabs);
+    if (seq !== renderSeq) return; // 已有更新的渲染请求，丢弃过期快照，防止旧数据把已关标签画回来
+
+    // 快照中已不存在的待关闭标签视为关闭成功；超过 2s 仍未确认的按失败处理，恢复显示
+    const rawIds = new Set(resp.tabs.map((t) => t.id));
+    const now = Date.now();
+    for (const [id, ts] of pendingClose) {
+      if (!rawIds.has(id) || now - ts > 2000) pendingClose.delete(id);
+    }
+    const tabs = sortTabs(resp.tabs.filter((t) => !pendingClose.has(t.id)));
     const showUrl = !!resp.showUrl;
 
     const sig = signature(tabs, showUrl);
@@ -259,34 +280,98 @@
     lastSig = sig;
 
     const b = ensureBar();
+    // 保存下拉展开状态，重绘后恢复；清理旧 handler 避免泄漏
+    sortMenuOpen = !!b.querySelector(".mrt-sort-menu.mrt-show");
+    if (sortCloseHandler) {
+      document.removeEventListener("mousedown", sortCloseHandler, true);
+      sortCloseHandler = null;
+    }
     b.textContent = "";
     ensureLauncher();
     b.classList.toggle("mrt-open", floatOpen);
     if (launcher) launcher.style.display = floatOpen ? "none" : "";
 
-    // 排序控件：位于标签栏开头，切换后立即重绘
-    const sortSel = document.createElement("select");
-    sortSel.className = "mrt-sort";
-    sortSel.title = "标签排序方式";
-    for (const [value, label] of [
+    // 排序控件：自定义下拉（原生 select 的文字垂直位置由浏览器内部布局决定，
+    // 不同字体/页面下无法可靠居中，改用 flex 布局自行控制）
+    const SORT_OPTIONS = [
       ["default", "默认"],
       ["title", "按名称"],
       ["host", "按域名"],
-    ]) {
-      const opt = document.createElement("option");
-      opt.value = value;
+    ];
+    const sortWrap = document.createElement("div");
+    sortWrap.className = "mrt-sort-wrap";
+    sortWrap.title = "标签排序方式";
+    const sortBtn = document.createElement("div");
+    sortBtn.className = "mrt-sort";
+    const sortLabel = document.createElement("span");
+    sortLabel.className = "mrt-sort-label";
+    const sortArrow = document.createElement("span");
+    sortArrow.className = "mrt-sort-arrow";
+    sortArrow.textContent = "▾";
+    sortBtn.appendChild(sortLabel);
+    sortBtn.appendChild(sortArrow);
+    sortWrap.appendChild(sortBtn);
+
+    const sortMenu = document.createElement("div");
+    sortMenu.className = "mrt-sort-menu";
+    for (const [value, label] of SORT_OPTIONS) {
+      const opt = document.createElement("div");
+      opt.className = "mrt-sort-opt";
       opt.textContent = label;
-      sortSel.appendChild(opt);
+      opt.addEventListener("mousedown", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        // 收起菜单并清理 document 级处理器
+        sortMenu.classList.remove("mrt-show");
+        sortMenuOpen = false;
+        if (sortCloseHandler) {
+          document.removeEventListener("mousedown", sortCloseHandler, true);
+          sortCloseHandler = null;
+        }
+        if (sortMode === value) return;
+        sortMode = value;
+        chrome.storage.local.set({ sortMode });
+        lastSig = ""; // 强制重绘
+        render();
+      });
+      sortMenu.appendChild(opt);
     }
-    sortSel.value = sortMode;
-    sortSel.addEventListener("click", (ev) => ev.stopPropagation());
-    sortSel.addEventListener("change", () => {
-      sortMode = sortSel.value;
-      chrome.storage.local.set({ sortMode });
-      lastSig = ""; // 强制重绘
-      render();
+    sortWrap.appendChild(sortMenu);
+
+    const sortLabelMap = Object.fromEntries(SORT_OPTIONS);
+    sortLabel.textContent = sortLabelMap[sortMode] || "默认";
+    // 同步选中态高亮
+    sortMenu.querySelectorAll(".mrt-sort-opt").forEach((el, i) => {
+      el.classList.toggle("mrt-sel", SORT_OPTIONS[i][0] === sortMode);
     });
-    b.appendChild(sortSel);
+    // render 重建后恢复展开状态
+    if (sortMenuOpen) sortMenu.classList.add("mrt-show");
+
+    sortBtn.addEventListener("mousedown", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const willOpen = !sortMenu.classList.contains("mrt-show");
+      // 清理旧处理器，避免多个 close 监听器并存
+      if (sortCloseHandler) {
+        document.removeEventListener("mousedown", sortCloseHandler, true);
+        sortCloseHandler = null;
+      }
+      sortMenu.classList.toggle("mrt-show", willOpen);
+      sortMenuOpen = willOpen;
+      if (willOpen) {
+        // 点击控件内部（按钮/选项）时不关闭，交由各自 mousedown 处理；
+        // 仅点击外部才收起，避免与选项 mousedown 竞争
+        sortCloseHandler = (e) => {
+          if (sortWrap.contains(e.target)) return;
+          sortMenu.classList.remove("mrt-show");
+          sortMenuOpen = false;
+          document.removeEventListener("mousedown", sortCloseHandler, true);
+          sortCloseHandler = null;
+        };
+        document.addEventListener("mousedown", sortCloseHandler, true);
+      }
+    });
+    b.appendChild(sortWrap);
 
     // 标签数量统计
     const countEl = document.createElement("span");
@@ -325,8 +410,7 @@
       close.addEventListener("click", (ev) => {
         ev.stopPropagation();
         chrome.runtime.sendMessage({ type: "mrt-close", tabId: t.id });
-        // 立即从展开的标签栏中移除该标签，无需等待 background 刷新
-        item.remove();
+        removeTabLocally(item, t.id); // 立即移除并同步计数，无需等待 background 刷新
       });
       main.appendChild(close);
 
@@ -340,19 +424,20 @@
         item.appendChild(urlEl);
       }
 
-      // 左键：切换到该标签
-      item.addEventListener("click", () => {
-        if (!t.active) {
-          chrome.runtime.sendMessage({ type: "mrt-activate", tabId: t.id });
-        }
-      });
-
-      // 中键：关闭该标签（与原生标签栏行为一致）
+      // 左键切换 / 中键关闭：均在 mousedown 阶段处理
+      // click 依赖 mousedown+mouseup 落在同一元素，异步重绘清空 DOM 会导致 click 丢失
+      // mousedown 在按下瞬间触发，不受后续 DOM 重建影响
       // 自动滚动由 mousedown 默认行为触发，必须在此阶段阻止，auxclick 时已太晚
       item.addEventListener("mousedown", (ev) => {
         if (ev.button === 1) {
           ev.preventDefault();
           ev.stopPropagation();
+          return;
+        }
+        if (ev.button === 0) {
+          // 直接发送激活消息，不依赖闭包中的 t.active（可能陈旧）；
+          // background 的 chrome.tabs.update 对已活动标签是幂等的
+          chrome.runtime.sendMessage({ type: "mrt-activate", tabId: t.id });
         }
       });
       item.addEventListener("auxclick", (ev) => {
@@ -360,7 +445,7 @@
           ev.preventDefault();
           ev.stopPropagation();
           chrome.runtime.sendMessage({ type: "mrt-close", tabId: t.id });
-          item.remove();
+          removeTabLocally(item, t.id);
         }
       });
 
@@ -449,7 +534,7 @@
             const tabId = parseInt(els[kbIndex].getAttribute("data-tab-id"), 10);
             if (!Number.isNaN(tabId)) {
               chrome.runtime.sendMessage({ type: "mrt-close", tabId });
-              els[kbIndex].remove();
+              removeTabLocally(els[kbIndex], tabId);
             }
           }
           return;
