@@ -359,6 +359,10 @@
       sortMenu.classList.toggle("mrt-show", willOpen);
       sortMenuOpen = willOpen;
       if (willOpen) {
+        // fixed 定位：按按钮实际位置计算坐标，不受 bar overflow 裁剪
+        const r = sortBtn.getBoundingClientRect();
+        sortMenu.style.left = r.left + "px";
+        sortMenu.style.top = r.bottom + 2 + "px";
         // 点击控件内部（按钮/选项）时不关闭，交由各自 mousedown 处理；
         // 仅点击外部才收起，避免与选项 mousedown 竞争
         sortCloseHandler = (e) => {

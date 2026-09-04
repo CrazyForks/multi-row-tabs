@@ -60,9 +60,7 @@
 
 #mrt-bar .mrt-sort-menu {
   display: none;
-  position: absolute;
-  top: 28px;
-  left: 0;
+  position: fixed; /* 脱离 bar 的 overflow 裁剪，由 JS 按按钮位置定位 */
   z-index: 10;
   min-width: 84px;
   padding: 4px 0;
